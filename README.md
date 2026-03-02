@@ -720,16 +720,6 @@ upgrade to **memory-lancedb-pro >= 1.0.14**. This plugin now coerces these value
 
 ---
 
-## ⭐ Star History
-
-<a href="https://star-history.com/#win4r/memory-lancedb-pro&Date">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=win4r/memory-lancedb-pro&type=Date&theme=dark&transparent=true" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=win4r/memory-lancedb-pro&type=Date&transparent=true" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=win4r/memory-lancedb-pro&type=Date&transparent=true" />
-  </picture>
-</a>
-
 ## Contributors
 
 Top contributors (from GitHub’s contributors list, sorted by commit contributions; bots excluded):
@@ -753,6 +743,16 @@ Top contributors (from GitHub’s contributors list, sorted by commit contributi
 - [@joe2643](https://github.com/joe2643) (1 commit)
 
 Full list: https://github.com/win4r/memory-lancedb-pro/graphs/contributors
+
+## ⭐ Star History
+
+<a href="https://star-history.com/#win4r/memory-lancedb-pro&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=win4r/memory-lancedb-pro&type=Date&theme=dark&transparent=true" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=win4r/memory-lancedb-pro&type=Date&transparent=true" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=win4r/memory-lancedb-pro&type=Date&transparent=true" />
+  </picture>
+</a>
 
 ## License
 

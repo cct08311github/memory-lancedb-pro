@@ -594,16 +594,6 @@ LanceDB 表 `memories`：
 
 ---
 
-## ⭐ Star 趋势
-
-<a href="https://star-history.com/#win4r/memory-lancedb-pro&Date">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=win4r/memory-lancedb-pro&type=Date&theme=dark&transparent=true" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=win4r/memory-lancedb-pro&type=Date&transparent=true" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=win4r/memory-lancedb-pro&type=Date&transparent=true" />
-  </picture>
-</a>
-
 ## 主要贡献者
 
 按 GitHub Contributors 列表自动生成（按 commit 贡献数排序，已排除 bot）：
@@ -627,6 +617,16 @@ LanceDB 表 `memories`：
 - [@joe2643](https://github.com/joe2643)（1 次提交）
 
 完整列表：https://github.com/win4r/memory-lancedb-pro/graphs/contributors
+
+## ⭐ Star 趋势
+
+<a href="https://star-history.com/#win4r/memory-lancedb-pro&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=win4r/memory-lancedb-pro&type=Date&theme=dark&transparent=true" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=win4r/memory-lancedb-pro&type=Date&transparent=true" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=win4r/memory-lancedb-pro&type=Date&transparent=true" />
+  </picture>
+</a>
 
 ## License
 
