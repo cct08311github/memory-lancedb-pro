@@ -6,6 +6,11 @@
 import type { MemoryStore, MemorySearchResult } from "./store.js";
 import type { Embedder } from "./embedder.js";
 import { filterNoise } from "./noise-filter.js";
+import {
+  AccessTracker,
+  parseAccessMetadata,
+  computeEffectiveHalfLife,
+} from "./access-tracker.js";
 
 // ============================================================================
 // Types & Configuration
@@ -24,10 +29,18 @@ export interface RetrievalConfig {
   recencyWeight: number;
   /** Filter noise from results (default: true) */
   filterNoise: boolean;
-  /** Jina Reranker API key (enables cross-encoder reranking) */
+  /** Reranker API key (enables cross-encoder reranking) */
   rerankApiKey?: string;
-  /** Jina Reranker model (default: jina-reranker-v2-base-multilingual) */
+  /** Reranker model (default: jina-reranker-v3) */
   rerankModel?: string;
+  /** Reranker API endpoint (default: https://api.jina.ai/v1/rerank). */
+  rerankEndpoint?: string;
+  /** Reranker provider format. Determines request/response shape and auth header.
+   *  - "jina" (default): Authorization: Bearer, string[] documents, results[].relevance_score
+   *  - "siliconflow": same format as jina (alias, for clarity)
+   *  - "voyage": Authorization: Bearer, string[] documents, data[].relevance_score
+   *  - "pinecone": Api-Key header, {text}[] documents, data[].score */
+  rerankProvider?: "jina" | "siliconflow" | "voyage" | "pinecone";
   /**
    * Length normalization: penalize long entries that dominate via sheer keyword
    * density. Formula: score *= 1 / (1 + log2(charLen / anchor)).
@@ -51,6 +64,12 @@ export interface RetrievalConfig {
    * Set 0 to disable. (default: 60)
    */
   timeDecayHalfLifeDays: number;
+  /** Access reinforcement factor for time decay half-life extension.
+   *  Higher = stronger reinforcement. 0 to disable. (default: 0.5) */
+  reinforcementFactor: number;
+  /** Maximum half-life multiplier from access reinforcement.
+   *  Prevents frequently accessed memories from becoming immortal. (default: 3) */
+  maxHalfLifeMultiplier: number;
 }
 
 export interface RetrievalContext {
@@ -58,6 +77,8 @@ export interface RetrievalContext {
   limit: number;
   scopeFilter?: string[];
   category?: string;
+  /** Retrieval source: "manual" for user-triggered, "auto-recall" for system-initiated. */
+  source?: "manual" | "auto-recall";
 }
 
 export interface RetrievalResult extends MemorySearchResult {
@@ -81,12 +102,15 @@ export const DEFAULT_RETRIEVAL_CONFIG: RetrievalConfig = {
   rerank: "cross-encoder",
   candidatePoolSize: 20,
   recencyHalfLifeDays: 14,
-  recencyWeight: 0.10,
+  recencyWeight: 0.1,
   filterNoise: true,
-  rerankModel: "jina-reranker-v2-base-multilingual",
+  rerankModel: "jina-reranker-v3",
+  rerankEndpoint: "https://api.jina.ai/v1/rerank",
   lengthNormAnchor: 500,
   hardMinScore: 0.35,
   timeDecayHalfLifeDays: 60,
+  reinforcementFactor: 0.5,
+  maxHalfLifeMultiplier: 3,
 };
 
 // ============================================================================
@@ -101,6 +125,134 @@ function clampInt(value: number, min: number, max: number): number {
 function clamp01(value: number, fallback: number): number {
   if (!Number.isFinite(value)) return Number.isFinite(fallback) ? fallback : 0;
   return Math.min(1, Math.max(0, value));
+}
+
+// ============================================================================
+// Rerank Provider Adapters
+// ============================================================================
+
+type RerankProvider = "jina" | "siliconflow" | "voyage" | "pinecone";
+
+interface RerankItem {
+  index: number;
+  score: number;
+}
+
+/** Build provider-specific request headers and body */
+function buildRerankRequest(
+  provider: RerankProvider,
+  apiKey: string,
+  model: string,
+  query: string,
+  documents: string[],
+  topN: number,
+): { headers: Record<string, string>; body: Record<string, unknown> } {
+  switch (provider) {
+    case "pinecone":
+      return {
+        headers: {
+          "Content-Type": "application/json",
+          "Api-Key": apiKey,
+          "X-Pinecone-API-Version": "2024-10",
+        },
+        body: {
+          model,
+          query,
+          documents: documents.map((text) => ({ text })),
+          top_n: topN,
+          rank_fields: ["text"],
+        },
+      };
+    case "voyage":
+      return {
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: {
+          model,
+          query,
+          documents,
+          // Voyage uses top_k (not top_n) to limit reranked outputs.
+          top_k: topN,
+        },
+      };
+    case "siliconflow":
+    case "jina":
+    default:
+      return {
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: {
+          model,
+          query,
+          documents,
+          top_n: topN,
+        },
+      };
+  }
+}
+
+/** Parse provider-specific response into unified format */
+function parseRerankResponse(
+  provider: RerankProvider,
+  data: Record<string, unknown>,
+): RerankItem[] | null {
+  const parseItems = (
+    items: unknown,
+    scoreKeys: Array<"score" | "relevance_score">,
+  ): RerankItem[] | null => {
+    if (!Array.isArray(items)) return null;
+    const parsed: RerankItem[] = [];
+    for (const raw of items as Array<Record<string, unknown>>) {
+      const index =
+        typeof raw?.index === "number" ? raw.index : Number(raw?.index);
+      if (!Number.isFinite(index)) continue;
+      let score: number | null = null;
+      for (const key of scoreKeys) {
+        const value = raw?.[key];
+        const n = typeof value === "number" ? value : Number(value);
+        if (Number.isFinite(n)) {
+          score = n;
+          break;
+        }
+      }
+      if (score === null) continue;
+      parsed.push({ index, score });
+    }
+    return parsed.length > 0 ? parsed : null;
+  };
+
+  switch (provider) {
+    case "pinecone": {
+      // Pinecone: usually { data: [{ index, score, ... }] }
+      // Also tolerate results[] with score/relevance_score for robustness.
+      return (
+        parseItems(data.data, ["score", "relevance_score"]) ??
+        parseItems(data.results, ["score", "relevance_score"])
+      );
+    }
+    case "voyage": {
+      // Voyage: usually { data: [{ index, relevance_score }] }
+      // Also tolerate results[] for compatibility across gateways.
+      return (
+        parseItems(data.data, ["relevance_score", "score"]) ??
+        parseItems(data.results, ["relevance_score", "score"])
+      );
+    }
+    case "siliconflow":
+    case "jina":
+    default: {
+      // Jina / SiliconFlow: usually { results: [{ index, relevance_score }] }
+      // Also tolerate data[] for compatibility across gateways.
+      return (
+        parseItems(data.results, ["relevance_score", "score"]) ??
+        parseItems(data.data, ["relevance_score", "score"])
+      );
+    }
+  }
 }
 
 // Cosine similarity for reranking fallback
@@ -128,53 +280,85 @@ function cosineSimilarity(a: number[], b: number[]): number {
 // ============================================================================
 
 export class MemoryRetriever {
+  private accessTracker: AccessTracker | null = null;
+
   constructor(
     private store: MemoryStore,
     private embedder: Embedder,
-    private config: RetrievalConfig = DEFAULT_RETRIEVAL_CONFIG
+    private config: RetrievalConfig = DEFAULT_RETRIEVAL_CONFIG,
   ) {}
 
+  setAccessTracker(tracker: AccessTracker): void {
+    this.accessTracker = tracker;
+  }
+
   async retrieve(context: RetrievalContext): Promise<RetrievalResult[]> {
-    const { query, limit, scopeFilter, category } = context;
+    const { query, limit, scopeFilter, category, source } = context;
     const safeLimit = clampInt(limit, 1, 20);
 
-    // For vector-only mode, use legacy behavior
+    let results: RetrievalResult[];
     if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
-      return this.vectorOnlyRetrieval(query, safeLimit, scopeFilter, category);
+      results = await this.vectorOnlyRetrieval(
+        query,
+        safeLimit,
+        scopeFilter,
+        category,
+      );
+    } else {
+      results = await this.hybridRetrieval(
+        query,
+        safeLimit,
+        scopeFilter,
+        category,
+      );
     }
 
-    // Hybrid retrieval with vector + BM25 + RRF fusion
-    return this.hybridRetrieval(query, safeLimit, scopeFilter, category);
+    // Record access for reinforcement (manual recall only)
+    if (this.accessTracker && source === "manual" && results.length > 0) {
+      this.accessTracker.recordAccess(results.map((r) => r.entry.id));
+    }
+
+    return results;
   }
 
   private async vectorOnlyRetrieval(
     query: string,
     limit: number,
     scopeFilter?: string[],
-    category?: string
+    category?: string,
   ): Promise<RetrievalResult[]> {
     const queryVector = await this.embedder.embedQuery(query);
-    const results = await this.store.vectorSearch(queryVector, limit, this.config.minScore, scopeFilter);
+    const results = await this.store.vectorSearch(
+      queryVector,
+      limit,
+      this.config.minScore,
+      scopeFilter,
+    );
 
     // Filter by category if specified
     const filtered = category
-      ? results.filter(r => r.entry.category === category)
+      ? results.filter((r) => r.entry.category === category)
       : results;
 
-    const mapped = filtered.map((result, index) => ({
-      ...result,
-      sources: {
-        vector: { score: result.score, rank: index + 1 },
-      },
-    } as RetrievalResult));
+    const mapped = filtered.map(
+      (result, index) =>
+        ({
+          ...result,
+          sources: {
+            vector: { score: result.score, rank: index + 1 },
+          },
+        }) as RetrievalResult,
+    );
 
     const boosted = this.applyRecencyBoost(mapped);
     const weighted = this.applyImportanceWeight(boosted);
     const lengthNormalized = this.applyLengthNormalization(weighted);
     const timeDecayed = this.applyTimeDecay(lengthNormalized);
-    const hardFiltered = timeDecayed.filter(r => r.score >= this.config.hardMinScore);
+    const hardFiltered = timeDecayed.filter(
+      (r) => r.score >= this.config.hardMinScore,
+    );
     const denoised = this.config.filterNoise
-      ? filterNoise(hardFiltered, r => r.entry.text)
+      ? filterNoise(hardFiltered, (r) => r.entry.text)
       : hardFiltered;
 
     // MMR deduplication: avoid top-k filled with near-identical memories
@@ -187,29 +371,44 @@ export class MemoryRetriever {
     query: string,
     limit: number,
     scopeFilter?: string[],
-    category?: string
+    category?: string,
   ): Promise<RetrievalResult[]> {
-    const candidatePoolSize = Math.max(this.config.candidatePoolSize, limit * 2);
+    const candidatePoolSize = Math.max(
+      this.config.candidatePoolSize,
+      limit * 2,
+    );
 
     // Compute query embedding once, reuse for vector search + reranking
     const queryVector = await this.embedder.embedQuery(query);
 
     // Run vector and BM25 searches in parallel
     const [vectorResults, bm25Results] = await Promise.all([
-      this.runVectorSearch(queryVector, candidatePoolSize, scopeFilter, category),
+      this.runVectorSearch(
+        queryVector,
+        candidatePoolSize,
+        scopeFilter,
+        category,
+      ),
       this.runBM25Search(query, candidatePoolSize, scopeFilter, category),
     ]);
 
-    // Fuse results using RRF
-    const fusedResults = this.fuseResults(vectorResults, bm25Results);
+    // Fuse results using RRF (async: validates BM25-only entries exist in store)
+    const fusedResults = await this.fuseResults(vectorResults, bm25Results);
 
     // Apply minimum score threshold
-    const filtered = fusedResults.filter(r => r.score >= this.config.minScore);
+    const filtered = fusedResults.filter(
+      (r) => r.score >= this.config.minScore,
+    );
 
     // Rerank if enabled
-    const reranked = this.config.rerank !== "none"
-      ? await this.rerankResults(query, queryVector, filtered.slice(0, limit * 2))
-      : filtered;
+    const reranked =
+      this.config.rerank !== "none"
+        ? await this.rerankResults(
+            query,
+            queryVector,
+            filtered.slice(0, limit * 2),
+          )
+        : filtered;
 
     // Apply temporal re-ranking (recency boost)
     const temporalReranked = this.applyRecencyBoost(reranked);
@@ -224,11 +423,13 @@ export class MemoryRetriever {
     const timeDecayed = this.applyTimeDecay(lengthNormalized);
 
     // Hard minimum score cutoff (post all scoring stages)
-    const hardFiltered = timeDecayed.filter(r => r.score >= this.config.hardMinScore);
+    const hardFiltered = timeDecayed.filter(
+      (r) => r.score >= this.config.hardMinScore,
+    );
 
     // Filter noise
     const denoised = this.config.filterNoise
-      ? filterNoise(hardFiltered, r => r.entry.text)
+      ? filterNoise(hardFiltered, (r) => r.entry.text)
       : hardFiltered;
 
     // MMR deduplication: avoid top-k filled with near-identical memories
@@ -241,13 +442,18 @@ export class MemoryRetriever {
     queryVector: number[],
     limit: number,
     scopeFilter?: string[],
-    category?: string
+    category?: string,
   ): Promise<Array<MemorySearchResult & { rank: number }>> {
-    const results = await this.store.vectorSearch(queryVector, limit, 0.1, scopeFilter);
+    const results = await this.store.vectorSearch(
+      queryVector,
+      limit,
+      0.1,
+      scopeFilter,
+    );
 
     // Filter by category if specified
     const filtered = category
-      ? results.filter(r => r.entry.category === category)
+      ? results.filter((r) => r.entry.category === category)
       : results;
 
     return filtered.map((result, index) => ({
@@ -260,13 +466,13 @@ export class MemoryRetriever {
     query: string,
     limit: number,
     scopeFilter?: string[],
-    category?: string
+    category?: string,
   ): Promise<Array<MemorySearchResult & { rank: number }>> {
     const results = await this.store.bm25Search(query, limit, scopeFilter);
 
     // Filter by category if specified
     const filtered = category
-      ? results.filter(r => r.entry.category === category)
+      ? results.filter((r) => r.entry.category === category)
       : results;
 
     return filtered.map((result, index) => ({
@@ -275,19 +481,19 @@ export class MemoryRetriever {
     }));
   }
 
-  private fuseResults(
+  private async fuseResults(
     vectorResults: Array<MemorySearchResult & { rank: number }>,
-    bm25Results: Array<MemorySearchResult & { rank: number }>
-  ): RetrievalResult[] {
+    bm25Results: Array<MemorySearchResult & { rank: number }>,
+  ): Promise<RetrievalResult[]> {
     // Create maps for quick lookup
     const vectorMap = new Map<string, MemorySearchResult & { rank: number }>();
     const bm25Map = new Map<string, MemorySearchResult & { rank: number }>();
 
-    vectorResults.forEach(result => {
+    vectorResults.forEach((result) => {
       vectorMap.set(result.entry.id, result);
     });
 
-    bm25Results.forEach(result => {
+    bm25Results.forEach((result) => {
       bm25Map.set(result.entry.id, result);
     });
 
@@ -301,6 +507,18 @@ export class MemoryRetriever {
       const vectorResult = vectorMap.get(id);
       const bm25Result = bm25Map.get(id);
 
+      // FIX(#15): BM25-only results may be "ghost" entries whose vector data was
+      // deleted but whose FTS index entry lingers until the next index rebuild.
+      // Validate that the entry actually exists in the store before including it.
+      if (!vectorResult && bm25Result) {
+        try {
+          const exists = await this.store.hasId(id);
+          if (!exists) continue; // Skip ghost entry
+        } catch {
+          // If hasId fails, keep the result (fail-open)
+        }
+      }
+
       // Use the result with more complete data (prefer vector result if both exist)
       const baseResult = vectorResult || bm25Result!;
 
@@ -310,19 +528,23 @@ export class MemoryRetriever {
       const bm25Hit = bm25Result ? 1 : 0;
 
       // Base = vector score; BM25 hit boosts by up to 15%
-      // BM25-only results use their normalized score (floor 0.5) so exact keyword
-      // matches aren't buried — e.g. searching "JINA_API_KEY" should surface even
-      // when vector distance is large.
+      // BM25-only results use their raw BM25 score so exact keyword matches
+      // (e.g. searching "JINA_API_KEY") still surface. The previous floor of 0.5
+      // was too generous and allowed ghost entries to survive hardMinScore (0.35).
       const fusedScore = vectorResult
-        ? clamp01(vectorScore + (bm25Hit * 0.15 * vectorScore), 0.1)
-        : clamp01(Math.max(bm25Result!.score, 0.5), 0.1);
+        ? clamp01(vectorScore + bm25Hit * 0.15 * vectorScore, 0.1)
+        : clamp01(bm25Result!.score, 0.1);
 
       fusedResults.push({
         entry: baseResult.entry,
         score: fusedScore,
         sources: {
-          vector: vectorResult ? { score: vectorResult.score, rank: vectorResult.rank } : undefined,
-          bm25: bm25Result ? { score: bm25Result.score, rank: bm25Result.rank } : undefined,
+          vector: vectorResult
+            ? { score: vectorResult.score, rank: vectorResult.rank }
+            : undefined,
+          bm25: bm25Result
+            ? { score: bm25Result.score, rank: bm25Result.rank }
+            : undefined,
           fused: { score: fusedScore },
         },
       });
@@ -333,60 +555,71 @@ export class MemoryRetriever {
   }
 
   /**
-   * Rerank results using Jina cross-encoder API (real rerank).
+   * Rerank results using cross-encoder API (Jina, Pinecone, or compatible).
    * Falls back to cosine similarity if API is unavailable or fails.
    */
-  private async rerankResults(query: string, queryVector: number[], results: RetrievalResult[]): Promise<RetrievalResult[]> {
+  private async rerankResults(
+    query: string,
+    queryVector: number[],
+    results: RetrievalResult[],
+  ): Promise<RetrievalResult[]> {
     if (results.length === 0) {
       return results;
     }
 
-    // Try cross-encoder rerank via Jina API
+    // Try cross-encoder rerank via configured provider API
     if (this.config.rerank === "cross-encoder" && this.config.rerankApiKey) {
       try {
-        const documents = results.map(r => r.entry.text);
-        const model = this.config.rerankModel || "jina-reranker-v2-base-multilingual";
+        const provider = this.config.rerankProvider || "jina";
+        const model = this.config.rerankModel || "jina-reranker-v3";
+        const endpoint =
+          this.config.rerankEndpoint || "https://api.jina.ai/v1/rerank";
+        const documents = results.map((r) => r.entry.text);
+
+        // Build provider-specific request
+        const { headers, body } = buildRerankRequest(
+          provider,
+          this.config.rerankApiKey,
+          model,
+          query,
+          documents,
+          results.length,
+        );
 
         // Timeout: 5 seconds to prevent stalling retrieval pipeline
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 5000);
 
-        const response = await fetch("https://api.jina.ai/v1/rerank", {
+        const response = await fetch(endpoint, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${this.config.rerankApiKey}`,
-          },
-          body: JSON.stringify({
-            model,
-            query,
-            documents,
-            top_n: results.length,
-          }),
+          headers,
+          body: JSON.stringify(body),
           signal: controller.signal,
         });
 
         clearTimeout(timeout);
 
         if (response.ok) {
-          const data = await response.json() as {
-            results?: Array<{ index: number; relevance_score: number }>;
-          };
+          const data = (await response.json()) as Record<string, unknown>;
 
-          // Validate response shape
-          if (!Array.isArray(data.results)) {
-            console.warn("Jina rerank: invalid response shape, falling back to cosine");
+          // Parse provider-specific response into unified format
+          const parsed = parseRerankResponse(provider, data);
+
+          if (!parsed) {
+            console.warn(
+              "Rerank API: invalid response shape, falling back to cosine",
+            );
           } else {
             // Build a Set of returned indices to identify unreturned candidates
-            const returnedIndices = new Set(data.results.map(r => r.index));
+            const returnedIndices = new Set(parsed.map((r) => r.index));
 
-            const reranked = data.results
-              .filter(item => item.index >= 0 && item.index < results.length)
-              .map(item => {
+            const reranked = parsed
+              .filter((item) => item.index >= 0 && item.index < results.length)
+              .map((item) => {
                 const original = results[item.index];
                 // Blend: 60% cross-encoder score + 40% original fused score
                 const blendedScore = clamp01(
-                  item.relevance_score * 0.6 + original.score * 0.4,
+                  item.score * 0.6 + original.score * 0.4,
                   original.score * 0.5,
                 );
                 return {
@@ -394,7 +627,7 @@ export class MemoryRetriever {
                   score: blendedScore,
                   sources: {
                     ...original.sources,
-                    reranked: { score: item.relevance_score },
+                    reranked: { score: item.score },
                   },
                 };
               });
@@ -402,27 +635,32 @@ export class MemoryRetriever {
             // Keep unreturned candidates with their original scores (slightly penalized)
             const unreturned = results
               .filter((_, idx) => !returnedIndices.has(idx))
-              .map(r => ({ ...r, score: r.score * 0.8 }));
+              .map((r) => ({ ...r, score: r.score * 0.8 }));
 
-            return [...reranked, ...unreturned].sort((a, b) => b.score - a.score);
+            return [...reranked, ...unreturned].sort(
+              (a, b) => b.score - a.score,
+            );
           }
         } else {
-          console.warn(`Jina rerank API returned ${response.status}, falling back to cosine`);
+          const errText = await response.text().catch(() => "");
+          console.warn(
+            `Rerank API returned ${response.status}: ${errText.slice(0, 200)}, falling back to cosine`,
+          );
         }
       } catch (error) {
         if (error instanceof Error && error.name === "AbortError") {
-          console.warn("Jina rerank timed out (5s), falling back to cosine");
+          console.warn("Rerank API timed out (5s), falling back to cosine");
         } else {
-          console.warn("Jina rerank failed, falling back to cosine:", error);
+          console.warn("Rerank API failed, falling back to cosine:", error);
         }
       }
     }
 
     // Fallback: lightweight cosine similarity rerank
     try {
-      const reranked = results.map(result => {
+      const reranked = results.map((result) => {
         const cosineScore = cosineSimilarity(queryVector, result.entry.vector);
-        const combinedScore = (result.score * 0.7) + (cosineScore * 0.3);
+        const combinedScore = result.score * 0.7 + cosineScore * 0.3;
 
         return {
           ...result,
@@ -454,8 +692,9 @@ export class MemoryRetriever {
     }
 
     const now = Date.now();
-    const boosted = results.map(r => {
-      const ts = (r.entry.timestamp && r.entry.timestamp > 0) ? r.entry.timestamp : now;
+    const boosted = results.map((r) => {
+      const ts =
+        r.entry.timestamp && r.entry.timestamp > 0 ? r.entry.timestamp : now;
       const ageDays = (now - ts) / 86_400_000;
       const boost = Math.exp(-ageDays / recencyHalfLifeDays) * recencyWeight;
       return {
@@ -476,7 +715,7 @@ export class MemoryRetriever {
    */
   private applyImportanceWeight(results: RetrievalResult[]): RetrievalResult[] {
     const baseWeight = 0.7;
-    const weighted = results.map(r => {
+    const weighted = results.map((r) => {
       const importance = r.entry.importance ?? 0.7;
       const factor = baseWeight + (1 - baseWeight) * importance;
       return {
@@ -494,11 +733,13 @@ export class MemoryRetriever {
    * Long, sprawling entries (> anchor) get penalized.
    * Formula: score *= 1 / (1 + log2(charLen / anchor))
    */
-  private applyLengthNormalization(results: RetrievalResult[]): RetrievalResult[] {
+  private applyLengthNormalization(
+    results: RetrievalResult[],
+  ): RetrievalResult[] {
     const anchor = this.config.lengthNormAnchor;
     if (!anchor || anchor <= 0) return results;
 
-    const normalized = results.map(r => {
+    const normalized = results.map((r) => {
       const charLen = r.entry.text.length;
       const ratio = charLen / anchor;
       // No penalty for entries at or below anchor length.
@@ -532,11 +773,25 @@ export class MemoryRetriever {
     if (!halfLife || halfLife <= 0) return results;
 
     const now = Date.now();
-    const decayed = results.map(r => {
-      const ts = (r.entry.timestamp && r.entry.timestamp > 0) ? r.entry.timestamp : now;
+    const decayed = results.map((r) => {
+      const ts =
+        r.entry.timestamp && r.entry.timestamp > 0 ? r.entry.timestamp : now;
       const ageDays = (now - ts) / 86_400_000;
+
+      // Access reinforcement: frequently recalled memories decay slower
+      const { accessCount, lastAccessedAt } = parseAccessMetadata(
+        r.entry.metadata,
+      );
+      const effectiveHL = computeEffectiveHalfLife(
+        halfLife,
+        accessCount,
+        lastAccessedAt,
+        this.config.reinforcementFactor,
+        this.config.maxHalfLifeMultiplier,
+      );
+
       // floor at 0.5: even very old entries keep at least 50% of their score
-      const factor = 0.5 + 0.5 * Math.exp(-ageDays / halfLife);
+      const factor = 0.5 + 0.5 * Math.exp(-ageDays / effectiveHL);
       return {
         ...r,
         score: clamp01(r.score * factor, r.score * 0.5),
@@ -558,7 +813,10 @@ export class MemoryRetriever {
    * (e.g. 3 similar "SVG style" memories) while keeping them available
    * if the pool is small.
    */
-  private applyMMRDiversity(results: RetrievalResult[], similarityThreshold = 0.85): RetrievalResult[] {
+  private applyMMRDiversity(
+    results: RetrievalResult[],
+    similarityThreshold = 0.85,
+  ): RetrievalResult[] {
     if (results.length <= 1) return results;
 
     const selected: RetrievalResult[] = [];
@@ -566,7 +824,7 @@ export class MemoryRetriever {
 
     for (const candidate of results) {
       // Check if this candidate is too similar to any already-selected result
-      const tooSimilar = selected.some(s => {
+      const tooSimilar = selected.some((s) => {
         // Both must have vectors to compare.
         // LanceDB returns Arrow Vector objects (not plain arrays),
         // so use .length directly and Array.from() for conversion.
@@ -635,7 +893,7 @@ export class MemoryRetriever {
 export function createRetriever(
   store: MemoryStore,
   embedder: Embedder,
-  config?: Partial<RetrievalConfig>
+  config?: Partial<RetrievalConfig>,
 ): MemoryRetriever {
   const fullConfig = { ...DEFAULT_RETRIEVAL_CONFIG, ...config };
   return new MemoryRetriever(store, embedder, fullConfig);
