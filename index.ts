@@ -6,7 +6,7 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { homedir } from "node:os";
 import { join, dirname, basename } from "node:path";
-import { readFile, readdir, writeFile, mkdir } from "node:fs/promises";
+import { readFile, readdir, writeFile, mkdir, appendFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 
 // Import core components
@@ -16,6 +16,7 @@ import { createRetriever, DEFAULT_RETRIEVAL_CONFIG } from "./src/retriever.js";
 import { createScopeManager } from "./src/scopes.js";
 import { createMigrator } from "./src/migrate.js";
 import { registerAllMemoryTools } from "./src/tools.js";
+import type { MdMirrorWriter } from "./src/tools.js";
 import { shouldSkipRetrieval } from "./src/adaptive-retrieval.js";
 import { AccessTracker } from "./src/access-tracker.js";
 import { createMemoryCLI } from "./cli.js";
@@ -39,6 +40,7 @@ interface PluginConfig {
   autoCapture?: boolean;
   autoRecall?: boolean;
   autoRecallMinLength?: number;
+  autoRecallMinRepeated?: number;
   captureAssistant?: boolean;
   retrieval?: {
     mode?: "hybrid" | "vector";
@@ -67,6 +69,7 @@ interface PluginConfig {
   };
   enableManagementTools?: boolean;
   sessionMemory?: { enabled?: boolean; messageCount?: number };
+  mdMirror?: { enabled?: boolean; dir?: string };
 }
 
 // ============================================================================
@@ -138,7 +141,11 @@ const CAPTURE_EXCLUDE_PATTERNS = [
 ];
 
 export function shouldCapture(text: string): boolean {
-  const s = text.trim();
+  let s = text.trim();
+
+  // Strip OpenClaw metadata headers (Conversation info or Sender)
+  const metadataPattern = /^(Conversation info|Sender) \(untrusted metadata\):[\s\S]*?\n\s*\n/gim;
+  s = s.replace(metadataPattern, "");
 
   // CJK characters carry more meaning per character, use lower minimum threshold
   const hasCJK = /[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/.test(
@@ -338,6 +345,92 @@ async function findPreviousSessionFile(
 }
 
 // ============================================================================
+// Markdown Mirror (dual-write)
+// ============================================================================
+
+type AgentWorkspaceMap = Record<string, string>;
+
+function resolveAgentWorkspaceMap(api: OpenClawPluginApi): AgentWorkspaceMap {
+  const map: AgentWorkspaceMap = {};
+
+  // Try api.config first (runtime config)
+  const agents = Array.isArray((api as any).config?.agents?.list)
+    ? (api as any).config.agents.list
+    : [];
+
+  for (const agent of agents) {
+    if (agent?.id && typeof agent.workspace === "string") {
+      map[String(agent.id)] = agent.workspace;
+    }
+  }
+
+  // Fallback: read from openclaw.json (respect OPENCLAW_HOME if set)
+  if (Object.keys(map).length === 0) {
+    try {
+      const openclawHome = process.env.OPENCLAW_HOME || join(homedir(), ".openclaw");
+      const configPath = join(openclawHome, "openclaw.json");
+      const raw = readFileSync(configPath, "utf8");
+      const parsed = JSON.parse(raw);
+      const list = parsed?.agents?.list;
+      if (Array.isArray(list)) {
+        for (const agent of list) {
+          if (agent?.id && typeof agent.workspace === "string") {
+            map[String(agent.id)] = agent.workspace;
+          }
+        }
+      }
+    } catch {
+      /* silent */
+    }
+  }
+
+  return map;
+}
+
+function createMdMirrorWriter(
+  api: OpenClawPluginApi,
+  config: PluginConfig,
+): MdMirrorWriter | null {
+  if (config.mdMirror?.enabled !== true) return null;
+
+  const fallbackDir = api.resolvePath(config.mdMirror.dir || "memory-md");
+  const workspaceMap = resolveAgentWorkspaceMap(api);
+
+  if (Object.keys(workspaceMap).length > 0) {
+    api.logger.info(
+      `mdMirror: resolved ${Object.keys(workspaceMap).length} agent workspace(s)`,
+    );
+  } else {
+    api.logger.warn(
+      `mdMirror: no agent workspaces found, writes will use fallback dir: ${fallbackDir}`,
+    );
+  }
+
+  return async (entry, meta) => {
+    try {
+      const ts = new Date(entry.timestamp || Date.now());
+      const dateStr = ts.toISOString().split("T")[0];
+
+      let mirrorDir = fallbackDir;
+      if (meta?.agentId && workspaceMap[meta.agentId]) {
+        mirrorDir = join(workspaceMap[meta.agentId], "memory");
+      }
+
+      const filePath = join(mirrorDir, `${dateStr}.md`);
+      const agentLabel = meta?.agentId ? ` agent=${meta.agentId}` : "";
+      const sourceLabel = meta?.source ? ` source=${meta.source}` : "";
+      const safeText = entry.text.replace(/\n/g, " ").slice(0, 500);
+      const line = `- ${ts.toISOString()} [${entry.category}:${entry.scope}]${agentLabel}${sourceLabel} ${safeText}\n`;
+
+      await mkdir(mirrorDir, { recursive: true });
+      await appendFile(filePath, line, "utf8");
+    } catch (err) {
+      api.logger.warn(`mdMirror: write failed: ${String(err)}`);
+    }
+  };
+}
+
+// ============================================================================
 // Version
 // ============================================================================
 
@@ -416,9 +509,22 @@ const memoryLanceDBProPlugin = {
 
     const pluginVersion = getPluginVersion();
 
+    // Session-based recall history to prevent redundant injections
+    // Map<sessionId, Map<memoryId, turnIndex>>
+    const recallHistory = new Map<string, Map<string, number>>();
+
+    // Map<sessionId, turnCounter> - manual turn tracking per session
+    const turnCounter = new Map<string, number>();
+
     api.logger.info(
       `memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"})`,
     );
+
+    // ========================================================================
+    // Markdown Mirror
+    // ========================================================================
+
+    const mdMirror = createMdMirrorWriter(api, config);
 
     // ========================================================================
     // Register Tools
@@ -432,6 +538,7 @@ const memoryLanceDBProPlugin = {
         scopeManager,
         embedder,
         agentId: undefined, // Will be determined at runtime from context
+        mdMirror,
       },
       {
         enableManagementTools: config.enableManagementTools,
@@ -468,6 +575,11 @@ const memoryLanceDBProPlugin = {
           return;
         }
 
+        // Manually increment turn counter for this session
+        const sessionId = ctx?.sessionId || "default";
+        const currentTurn = (turnCounter.get(sessionId) || 0) + 1;
+        turnCounter.set(sessionId, currentTurn);
+
         try {
           // Determine agent ID and accessible scopes
           const agentId = ctx?.agentId || "main";
@@ -484,7 +596,46 @@ const memoryLanceDBProPlugin = {
             return;
           }
 
-          const memoryContext = results
+          // Filter out redundant memories based on session history
+          const minRepeated = config.autoRecallMinRepeated ?? 0;
+
+          // Only enable dedup logic when minRepeated > 0
+          let finalResults = results;
+
+          if (minRepeated > 0) {
+            const sessionHistory = recallHistory.get(sessionId) || new Map<string, number>();
+            const filteredResults = results.filter((r) => {
+              const lastTurn = sessionHistory.get(r.entry.id) ?? -999;
+              const diff = currentTurn - lastTurn;
+              const isRedundant = diff < minRepeated;
+
+              if (isRedundant) {
+                api.logger.debug?.(
+                  `memory-lancedb-pro: skipping redundant memory ${r.entry.id.slice(0, 8)} (last seen at turn ${lastTurn}, current turn ${currentTurn}, min ${minRepeated})`,
+                );
+              }
+              return !isRedundant;
+            });
+
+            if (filteredResults.length === 0) {
+              if (results.length > 0) {
+                api.logger.info?.(
+                  `memory-lancedb-pro: all ${results.length} memories were filtered out due to redundancy policy`,
+                );
+              }
+              return;
+            }
+
+            // Update history with successfully injected memories
+            for (const r of filteredResults) {
+              sessionHistory.set(r.entry.id, currentTurn);
+            }
+            recallHistory.set(sessionId, sessionHistory);
+
+            finalResults = filteredResults;
+          }
+
+          const memoryContext = finalResults
             .map(
               (r) =>
                 `- [${r.entry.category}:${r.entry.scope}] ${sanitizeForContext(r.entry.text)} (${(r.score * 100).toFixed(0)}%${r.sources?.bm25 ? ", vector+BM25" : ""}${r.sources?.reranked ? "+reranked" : ""})`,
@@ -492,7 +643,7 @@ const memoryLanceDBProPlugin = {
             .join("\n");
 
           api.logger.info?.(
-            `memory-lancedb-pro: injecting ${results.length} memories into context for agent ${agentId}`,
+            `memory-lancedb-pro: injecting ${finalResults.length} memories into context for agent ${agentId}`,
           );
 
           return {
@@ -574,9 +725,17 @@ const memoryLanceDBProPlugin = {
             const vector = await embedder.embedPassage(text);
 
             // Check for duplicates using raw vector similarity (bypasses importance/recency weighting)
-            const existing = await store.vectorSearch(vector, 1, 0.1, [
-              defaultScope,
-            ]);
+            // Fail-open by design: dedup should not block auto-capture writes.
+            let existing: Awaited<ReturnType<typeof store.vectorSearch>> = [];
+            try {
+              existing = await store.vectorSearch(vector, 1, 0.1, [
+                defaultScope,
+              ]);
+            } catch (err) {
+              api.logger.warn(
+                `memory-lancedb-pro: auto-capture duplicate pre-check failed, continue store: ${String(err)}`,
+              );
+            }
 
             if (existing.length > 0 && existing[0].score > 0.95) {
               continue;
@@ -590,6 +749,14 @@ const memoryLanceDBProPlugin = {
               scope: defaultScope,
             });
             stored++;
+
+            // Dual-write to Markdown mirror if enabled
+            if (mdMirror) {
+              await mdMirror(
+                { text, category, scope: defaultScope, timestamp: Date.now() },
+                { source: "auto-capture", agentId },
+              );
+            }
           }
 
           if (stored > 0) {
@@ -698,6 +865,14 @@ const memoryLanceDBProPlugin = {
               date: dateStr,
             }),
           });
+
+          // Dual-write to Markdown mirror if enabled
+          if (mdMirror) {
+            await mdMirror(
+              { text: memoryText.replace(/\n/g, " ").slice(0, 500), category: "fact", scope: "global", timestamp: Date.now() },
+              { source: "session-memory" },
+            );
+          }
 
           api.logger.info(
             `session-memory: stored session summary for ${currentSessionId || "unknown"}`,
@@ -894,7 +1069,6 @@ function parsePluginConfig(value: unknown): PluginConfig {
   if (!apiKey || (Array.isArray(apiKey) && apiKey.length === 0)) {
     throw new Error("embedding.apiKey is required (set directly or via OPENAI_API_KEY env var)");
   }
-  }
 
   return {
     embedding: {
@@ -929,6 +1103,7 @@ function parsePluginConfig(value: unknown): PluginConfig {
     // Default OFF: only enable when explicitly set to true.
     autoRecall: cfg.autoRecall === true,
     autoRecallMinLength: parsePositiveInt(cfg.autoRecallMinLength),
+    autoRecallMinRepeated: parsePositiveInt(cfg.autoRecallMinRepeated),
     captureAssistant: cfg.captureAssistant === true,
     retrieval:
       typeof cfg.retrieval === "object" && cfg.retrieval !== null
@@ -949,6 +1124,17 @@ function parsePluginConfig(value: unknown): PluginConfig {
                 .messageCount === "number"
                 ? ((cfg.sessionMemory as Record<string, unknown>)
                     .messageCount as number)
+                : undefined,
+          }
+        : undefined,
+    mdMirror:
+      typeof cfg.mdMirror === "object" && cfg.mdMirror !== null
+        ? {
+            enabled:
+              (cfg.mdMirror as Record<string, unknown>).enabled === true,
+            dir:
+              typeof (cfg.mdMirror as Record<string, unknown>).dir === "string"
+                ? ((cfg.mdMirror as Record<string, unknown>).dir as string)
                 : undefined,
           }
         : undefined,

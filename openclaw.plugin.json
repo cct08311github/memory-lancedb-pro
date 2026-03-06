@@ -2,7 +2,7 @@
   "id": "memory-lancedb-pro",
   "name": "Memory (LanceDB Pro)",
   "description": "Enhanced LanceDB-backed long-term memory with hybrid retrieval, multi-scope isolation, long-context chunking, and management CLI",
-  "version": "1.0.26",
+  "version": "1.0.32",
   "kind": "memory",
   "configSchema": {
     "type": "object",
@@ -86,6 +86,13 @@
         "maximum": 200,
         "default": 15,
         "description": "Minimum prompt length (in characters) to trigger auto-recall. Prompts shorter than this are skipped. Default: 15 for English, 6 for CJK."
+      },
+      "autoRecallMinRepeated": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 100,
+        "default": 0,
+        "description": "Minimum number of turns before the same memory can be recalled again in the same session. Set to 0 to disable deduplication (default behavior: inject all memories)."
       },
       "captureAssistant": {
         "type": "boolean"
@@ -263,6 +270,21 @@
             }
           }
         }
+      },
+      "mdMirror": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "Enable dual-write: store memories in both LanceDB and human-readable Markdown files"
+          },
+          "dir": {
+            "type": "string",
+            "description": "Fallback directory for Markdown mirror files when agent workspace is unknown"
+          }
+        }
       }
     },
     "required": [
@@ -332,6 +354,11 @@
     "autoRecallMinLength": {
       "label": "Auto-Recall Min Length",
       "help": "Minimum prompt length to trigger auto-recall (shorter prompts are skipped). Default: 15 chars for English, 6 for CJK.",
+      "advanced": true
+    },
+    "autoRecallMinRepeated": {
+      "label": "Auto-Recall Min Repeated",
+      "help": "Minimum number of conversation turns before a specific memory can be re-injected in the same session.",
       "advanced": true
     },
     "captureAssistant": {
@@ -435,6 +462,15 @@
     "enableManagementTools": {
       "label": "Management Tools",
       "help": "Enable memory_list and memory_stats tools for debugging and auditing",
+      "advanced": true
+    },
+    "mdMirror.enabled": {
+      "label": "Markdown Mirror",
+      "help": "Write a human-readable Markdown copy alongside LanceDB storage (dual-write mode)"
+    },
+    "mdMirror.dir": {
+      "label": "Mirror Fallback Directory",
+      "help": "Fallback directory when agent workspace mapping is unavailable",
       "advanced": true
     }
   }

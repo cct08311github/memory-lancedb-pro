@@ -24,12 +24,18 @@ export const MEMORY_CATEGORIES = [
   "other",
 ] as const;
 
+export type MdMirrorWriter = (
+  entry: { text: string; category: string; scope: string; timestamp?: number },
+  meta?: { source?: string; agentId?: string },
+) => Promise<void>;
+
 interface ToolContext {
   retriever: MemoryRetriever;
   store: MemoryStore;
   scopeManager: MemoryScopeManager;
   embedder: Embedder;
   agentId?: string;
+  mdMirror?: MdMirrorWriter | null;
 }
 
 function resolveAgentId(runtimeAgentId: unknown, fallback?: string): string | undefined {
@@ -263,9 +269,17 @@ export function registerMemoryStoreTool(
           const vector = await context.embedder.embedPassage(text);
 
           // Check for duplicates using raw vector similarity (bypasses importance/recency weighting)
-          const existing = await context.store.vectorSearch(vector, 1, 0.1, [
-            targetScope,
-          ]);
+          // Fail-open by design: dedup must never block a legitimate memory write.
+          let existing: Awaited<ReturnType<typeof context.store.vectorSearch>> = [];
+          try {
+            existing = await context.store.vectorSearch(vector, 1, 0.1, [
+              targetScope,
+            ]);
+          } catch (err) {
+            console.warn(
+              `memory-lancedb-pro: duplicate pre-check failed, continue store: ${String(err)}`,
+            );
+          }
 
           if (existing.length > 0 && existing[0].score > 0.98) {
             return {
@@ -292,6 +306,14 @@ export function registerMemoryStoreTool(
             category: category as any,
             scope: targetScope,
           });
+
+          // Dual-write to Markdown mirror if enabled
+          if (context.mdMirror) {
+            await context.mdMirror(
+              { text, category: category as string, scope: targetScope, timestamp: entry.timestamp },
+              { source: "memory_store", agentId },
+            );
+          }
 
           return {
             content: [
