@@ -18,7 +18,7 @@ Hybrid Retrieval (Vector + BM25) · Cross-Encoder Rerank · Multi-Scope Isolatio
 
 ## 📺 Video Tutorial
 
-> **Watch the full walkthrough — covers installation, configuration, and how hybrid retrieval works under the hood.**
+> **Watch the full walkthrough - covers installation, configuration, and how hybrid retrieval works under the hood.**
 
 [![YouTube Video](https://img.shields.io/badge/YouTube-Watch%20Now-red?style=for-the-badge&logo=youtube)](https://youtu.be/MtukF1C8epQ)
 🔗 **https://youtu.be/MtukF1C8epQ**
@@ -55,40 +55,58 @@ The built-in `memory-lancedb` plugin in OpenClaw provides basic vector search. *
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                   index.ts (Entry Point)                │
-│  Plugin Registration · Config Parsing · Lifecycle Hooks │
-└────────┬──────────┬──────────┬──────────┬───────────────┘
-         │          │          │          │
-    ┌────▼───┐ ┌────▼───┐ ┌───▼────┐ ┌──▼──────────┐
-    │ store  │ │embedder│ │retriever│ │   scopes    │
-    │ .ts    │ │ .ts    │ │ .ts    │ │    .ts      │
-    └────────┘ └────────┘ └────────┘ └─────────────┘
-         │                     │
-    ┌────▼───┐           ┌─────▼──────────┐
-    │migrate │           │noise-filter.ts │
-    │ .ts    │           │adaptive-       │
-    └────────┘           │retrieval.ts    │
-                         └────────────────┘
-    ┌─────────────┐   ┌──────────┐
-    │  tools.ts   │   │  cli.ts  │
-    │ (Agent API) │   │ (CLI)    │
-    └─────────────┘   └──────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                         index.ts (Entry Point)                      │
+│     Plugin registration · config parsing · lifecycle orchestration  │
+└────────┬───────────────────────────────┬─────────────────────────────┘
+         │                               │
+         │ generic auto-recall           │ reflection / inherited-rules
+         │                               │
+┌────────▼────────┐              ┌───────▼───────────────────────────┐
+│   retriever.ts  │              │       reflection-recall.ts        │
+│ vector/BM25/RRF │              │ dynamic reflection recall ranking │
+│ rerank/filters  │              └───────────────┬───────────────────┘
+└────────┬────────┘                              │
+         │                               ┌──────▼────────────────────┐
+┌────────▼───────────────┐               │ reflection-aggregation.ts │
+│ postProcessAutoRecall  │               │ strictKey-group scoring   │
+│ (index.ts local step)  │               └──────┬────────────────────┘
+└────────┬───────────────┘                      │
+         │                               ┌──────▼───────────────────────┐
+         │ mmr | setwise-v2              │ reflection-recall-final-     │
+┌────────▼────────────────────┐           │ selection.ts                 │
+│ auto-recall-final-          │           └──────┬───────────────────────┘
+│ selection.ts                │                  │
+└────────┬────────────────────┘           ┌──────▼───────────────────────┐
+         └────────────────────────────────► final-topk-setwise-         │
+                                          │ selection.ts                │
+                                          │ shared final top-k selector │
+                                          └─────────────────────────────┘
+
+Shared infrastructure: `store.ts`, `embedder.ts`, `scopes.ts`, `tools.ts`,
+`noise-filter.ts`, `adaptive-retrieval.ts`, `recall-engine.ts`, `migrate.ts`, `cli.ts`
 ```
 
 ### File Reference
 
 | File | Purpose |
 |------|---------|
-| `index.ts` | Plugin entry point. Registers with OpenClaw Plugin API, parses config, mounts `before_agent_start` (auto-recall), `agent_end` (auto-capture), and `command:new` (session memory) hooks |
+| `index.ts` | Plugin entry point. Registers with OpenClaw Plugin API, parses config, mounts lifecycle hooks (`before_agent_start` / `before_prompt_build` / `agent_end`), routes generic auto-recall through `mmr | setwise-v2`, and coordinates reflection injection flows |
 | `openclaw.plugin.json` | Plugin metadata + full JSON Schema config declaration (with `uiHints`) |
 | `package.json` | NPM package info. Depends on `@lancedb/lancedb`, `openai`, `@sinclair/typebox` |
 | `cli.ts` | CLI commands: `memory list/search/stats/delete/delete-bulk/export/import/reembed/migrate` |
 | `src/store.ts` | LanceDB storage layer. Table creation / FTS indexing / Vector search / BM25 search / CRUD / bulk delete / stats |
 | `src/embedder.ts` | Embedding abstraction. Compatible with any OpenAI-API provider (OpenAI, Gemini, Jina, Ollama, etc.). Supports task-aware embedding (`taskQuery`/`taskPassage`) |
-| `src/retriever.ts` | Hybrid retrieval engine. Vector + BM25 → RRF fusion → Jina Cross-Encoder Rerank → Recency Boost → Importance Weight → Length Norm → Time Decay → Hard Min Score → Noise Filter → MMR Diversity |
+| `src/retriever.ts` | Hybrid retrieval engine. Vector + BM25 → RRF fusion → rerank → recency / importance / length / decay weighting → noise filter → coarse MMR diversity. |
+| `src/recall-engine.ts` | Shared recall helpers: prompt gating, session repeated-injection suppression, tagged-block assembly, max-age filtering, and recent-per-key capping |
+| `src/auto-recall-final-selection.ts` | Generic auto-recall adapter. Maps `RetrievalResult` rows into final-selection candidates and applies generic `mmr | setwise-v2` behavior at the final cutoff seam |
+| `src/final-topk-setwise-selection.ts` | Shared final top-k selector. Owns shortlist presort, deterministic set-wise selection, lexical-overlap suppression, and optional embedding-based semantic redundancy suppression |
+| `src/reflection-recall.ts` | Dynamic Reflection-Recall ranking for `<inherited-rules>`. Filters/caps reflection items, computes scores, preserves `kind + strictKey` partitioning, and maps selected groups back to recall rows |
+| `src/reflection-aggregation.ts` | Reflection group aggregation. Combines scored reflection items into strict-key groups with representative selection and final group scoring |
+| `src/reflection-recall-final-selection.ts` | Reflection-specific adapter into the shared final selector for dynamic Reflection-Recall final top-k ordering |
+| `src/reflection-selection.ts` | Historical derived-focus diversity ordering helper retained for reflection-store / handoff-note selection flows |
 | `src/scopes.ts` | Multi-scope access control. Supports `global`, `agent:<id>`, `custom:<name>`, `project:<id>`, `user:<id>` |
-| `src/tools.ts` | Agent tool definitions: `memory_recall`, `memory_store`, `memory_forget` (core) + `memory_stats`, `memory_list` (management) |
+| `src/tools.ts` | Agent tool definitions: `memory_recall`, `memory_store`, `memory_forget` (core), `self_improvement_log` (default), and governance tools `self_improvement_review` / `self_improvement_extract_skill` (management mode) |
 | `src/noise-filter.ts` | Noise filter. Filters out agent refusals, meta-questions, greetings, and low-quality content |
 | `src/adaptive-retrieval.ts` | Adaptive retrieval. Determines whether a query needs memory retrieval (skips greetings, slash commands, simple confirmations, emoji) |
 | `src/migrate.ts` | Migration tool. Migrates data from the built-in `memory-lancedb` plugin to Pro |
@@ -146,17 +164,166 @@ Filters out low-quality content at both auto-capture and tool-store stages:
 - Meta-questions ("do you remember")
 - Greetings ("hi", "hello", "HEARTBEAT")
 
-### 7. Session Memory
+### 7. Session Strategy
 
-- Triggered on `/new` command — saves previous session summary to LanceDB
-- Disabled by default (OpenClaw already has native `.jsonl` session persistence)
-- Configurable message count (default: 15)
+Use this to choose who owns `/new` / `/reset` session behavior.
 
-### 8. Auto-Capture & Auto-Recall
+- `sessionStrategy: "systemSessionMemory"` (default)
+  - use OpenClaw built-in `session-memory`
+  - plugin reflection hooks stay off
+- `sessionStrategy: "memoryReflection"`
+  - enable plugin reflection flow
+  - `memoryReflection.*` settings take effect only in this mode
+- `sessionStrategy: "none"`
+  - disable plugin session strategy hooks entirely
+
+ Legacy compatibility:
+- `sessionMemory.enabled=true|false` still maps to `systemSessionMemory|none`
+- `sessionMemory.messageCount` still maps to `memoryReflection.messageCount`
+
+Recommended starter config:
+
+```json
+{
+  "sessionStrategy": "memoryReflection"
+}
+```
+
+### 8. Self-Improvement
+
+Use this when you want the plugin to keep a lightweight governance trail of learnings and errors.
+
+- Main tools:
+  - `self_improvement_log`: append a structured learning/error entry
+  - `self_improvement_review`: summarize pending governance backlog
+  - `self_improvement_extract_skill`: scaffold a reusable skill from a proven learning entry
+- Main config:
+  - `selfImprovement.enabled`: master switch
+  - `selfImprovement.beforeResetNote`: show a reminder before `/new` or `/reset`
+  - `selfImprovement.ensureLearningFiles`: auto-create `.learnings/` files
+  - `selfImprovement.managementTools`: expose review/extract tools
+- Main outputs:
+  - `.learnings/LEARNINGS.md`
+  - `.learnings/ERRORS.md`
+  - extracted skill scaffold under `.learnings/skills/...`
+
+Recommended starter config:
+
+```json
+{
+  "selfImprovement": {
+    "enabled": true,
+    "beforeResetNote": true,
+    "ensureLearningFiles": true,
+    "managementTools": true
+  }
+}
+```
+
+### 9. memoryReflection
+
+Use this when you want reflection-based rule inheritance and optional reflection persistence.
+
+What to configure first:
+- `memoryReflection.enabled`: turn reflection features on/off
+- `memoryReflection.injectMode`:
+  - `inheritance-only` = inject inherited rules only
+  - `inheritance+derived` = inherited rules + derived-focus note on `/new` / `/reset`
+- `memoryReflection.recall.mode`:
+  - `fixed` = compatibility path
+  - `dynamic` = prompt-gated `<inherited-rules>` recall
+- `memoryReflection.storeToLanceDB`: store reflection event/item rows in LanceDB
+- `memoryReflection.agentId` (optional): use a dedicated reflection agent
+
+Recommended starter config:
+
+```json
+{
+  "memoryReflection": {
+    "enabled": true,
+    "injectMode": "inheritance-only",
+    "storeToLanceDB": true,
+    "recall": {
+      "mode": "dynamic",
+      "topK": 6,
+      "includeKinds": ["invariant", "derived"],
+      "maxAgeDays": 14,
+      "maxEntriesPerKey": 7,
+      "minRepeated": 3,
+      "minScore": 0.22,
+      "minPromptLength": 12
+    }
+  }
+}
+```
+
+Quick behavior guide:
+- `before_prompt_build` can inject `<inherited-rules>`
+- `/new` / `/reset` can build the reflection note
+- `before_prompt_build` can also inject `<error-detected>` reminders
+- dynamic recall keeps `kind + strictKey` separation for invariant/derived rows
+
+### 10. Markdown Mirror (`mdMirror`)
+
+Use this when you want a readable Markdown copy of memories in addition to LanceDB.
+
+Main config:
+- `mdMirror.enabled`: turn Markdown dual-write on/off
+- `mdMirror.dir`: fallback output directory when the agent workspace path is unavailable
+
+What it does:
+- writes memory entries to readable Markdown files
+- prefers `memory/YYYY-MM-DD.md` in the mapped workspace
+- falls back to `mdMirror.dir` when needed
+- does not replace LanceDB retrieval/storage
+
+Recommended starter config:
+
+```json
+{
+  "mdMirror": {
+    "enabled": true,
+    "dir": "memory-md"
+  }
+}
+```
+
+### 11. Long Context Chunking
+
+Automatically handles documents that exceed embedding model context limits:
+
+- **Smart splitting**: Chunks at sentence boundaries with configurable overlap (default: 200 chars)
+- **Averaged embedding**: Each chunk is embedded separately, then averaged for semantic preservation
+- **Graceful error handling**: Detects "Input length exceeds context length" errors and retries with chunking
+- **Config toggle**: `embedding.chunking` - set `false` to disable (default: auto-enabled on context-length errors)
+- **Adapts to model limits**: Jina (8192 tokens), OpenAI (8191), Gemini (2048), etc.
+
+See [`docs/long-context-chunking.md`](docs/long-context-chunking.md) for implementation details.
+
+### 12. Embedding Error Diagnostics
+
+When embedding calls fail, the plugin provides **actionable error messages** instead of generic errors:
+
+- **Auth errors** (401/403): hints to check API key validity and format
+- **Network errors** (ECONNREFUSED, ETIMEDOUT): hints to verify `baseURL` and network connectivity
+- **Rate limits** (429): suggests retry or upgrading plan
+- **Model not found** (404): suggests checking model name against provider docs
+- **Context length exceeded**: automatically retries with chunking (see above)
+
+### 13. Auto-Capture & Auto-Recall
 
 - **Auto-Capture** (`agent_end` hook): Extracts preference/fact/decision/entity from conversations, deduplicates, stores up to 3 per turn
   - Skips memory-management prompts (e.g. delete/forget/cleanup memory entries) to reduce noise
-- **Auto-Recall** (`before_agent_start` hook): Injects `<relevant-memories>` context (up to 3 entries)
+- **Auto-Recall** (`before_agent_start` hook): Injects `<relevant-memories>` context
+  - Default top-k: `autoRecallTopK=3`
+  - Generic final-selection mode: `autoRecallSelectionMode` (`mmr` by default; `setwise-v2` to enable set-wise final selector)
+  - Default category allowlist: `preference`, `fact`, `decision`, `entity`, `other`
+  - `autoRecallExcludeReflection=true` by default, so `<relevant-memories>` stays separate from `<inherited-rules>`
+  - Supports age window (`autoRecallMaxAgeDays`) and recent-per-key cap (`autoRecallMaxEntriesPerKey`)
+  - `mmr`: post-processed rows use direct truncation (`slice(0, topK)`); this is simpler and closer to current retriever order, usually with stronger per-item relevance/score stability, but diversity/coverage is weaker
+  - `setwise-v2`: final top-k uses shared set-wise selection (base score + freshness + light category/scope coverage + lexical overlap suppression + embedding-based semantic near-duplicate suppression), so diversity/coverage in the final top-k is usually better, but average per-item score/relevance can be lower than `mmr`
+  - Choose according to your preference: prioritize rank stability/relevance with `mmr`, or prioritize diversity/coverage with `setwise-v2`.
+  - This mode is generic auto-recall only. Reflection-Recall mode remains `fixed | dynamic`.
 
 ### Prevent memories from showing up in replies
 
@@ -191,6 +358,22 @@ Add a line to your agent system prompt, e.g.:
 
 ## Installation
 
+> **🧪 Beta available: v1.1.0-beta.6**
+>
+> A beta release is available with major new features: **Self-Improvement governance**, **memoryReflection session strategy**, **Markdown Mirror**, and improved embedding error diagnostics. The stable `latest` remains at v1.0.32.
+>
+> ```bash
+> # Install beta (opt-in)
+> npm install memory-lancedb-pro@beta
+>
+> # Install stable (default)
+> npm install memory-lancedb-pro
+> ```
+>
+> See [Release Notes](https://github.com/win4r/memory-lancedb-pro/releases/tag/v1.1.0-beta.6) for details. Feedback welcome via [GitHub Issues](https://github.com/win4r/memory-lancedb-pro/issues).
+>
+> The `dev` dist-tag is an experimental track intended for early testing of the smart-memory feature set and may diverge from the mainline beta.
+ 
 ### AI-safe install notes (anti-hallucination)
 
 If you are following this README using an AI assistant, **do not assume defaults**. Always run these commands first and use the real output:
@@ -211,15 +394,15 @@ Recommendations:
 
 - **Embedding**: set `embedding.apiKey` to your Jina key (recommended: use an env var like `${JINA_API_KEY}`).
 - **Rerank** (when `retrieval.rerankProvider: "jina"`): you can typically use the **same** Jina key for `retrieval.rerankApiKey`.
-- If you use a different rerank provider (`siliconflow`, `pinecone`, etc.), `retrieval.rerankApiKey` should be that provider’s key.
+- If you use a different rerank provider (`siliconflow`, `pinecone`, etc.), `retrieval.rerankApiKey` should be that provider's key.
 
 Key storage guidance:
 - Avoid committing secrets into git.
 - Using `${...}` env vars is fine, but make sure the **Gateway service process** has those env vars (system services often do not inherit your interactive shell environment).
 
-### What is the “OpenClaw workspace”?
+### What is the "OpenClaw workspace"?
 
-In OpenClaw, the **agent workspace** is the agent’s working directory (default: `~/.openclaw/workspace`).
+In OpenClaw, the **agent workspace** is the agent's working directory (default: `~/.openclaw/workspace`).
 According to the docs, the workspace is the **default cwd**, and **relative paths are resolved against the workspace** (unless you use an absolute path).
 
 > Note: OpenClaw configuration typically lives under `~/.openclaw/openclaw.json` (separate from the workspace).
@@ -337,11 +520,18 @@ openclaw config get plugins.slots.memory
   "dbPath": "~/.openclaw/memory/lancedb-pro",
   "autoCapture": true,
   "autoRecall": false,
+  "autoRecallMinLength": 8,
+  "autoRecallTopK": 3,
+  "autoRecallSelectionMode": "mmr",
+  "autoRecallCategories": ["preference", "fact", "decision", "entity", "other"],
+  "autoRecallExcludeReflection": true,
+  "autoRecallMaxAgeDays": 30,
+  "autoRecallMaxEntriesPerKey": 10,
   "retrieval": {
     "mode": "hybrid",
     "vectorWeight": 0.7,
     "bm25Weight": 0.3,
-    "minScore": 0.3,
+    "minScore": 0.45,
     "rerank": "cross-encoder",
     "rerankApiKey": "${JINA_API_KEY}",
     "rerankModel": "jina-reranker-v3",
@@ -352,12 +542,13 @@ openclaw config get plugins.slots.memory
     "recencyWeight": 0.1,
     "filterNoise": true,
     "lengthNormAnchor": 500,
-    "hardMinScore": 0.35,
+    "hardMinScore": 0.55,
     "timeDecayHalfLifeDays": 60,
     "reinforcementFactor": 0.5,
     "maxHalfLifeMultiplier": 3
   },
   "enableManagementTools": false,
+  "sessionStrategy": "systemSessionMemory",
   "scopes": {
     "default": "global",
     "definitions": {
@@ -368,22 +559,77 @@ openclaw config get plugins.slots.memory
       "discord-bot": ["global", "agent:discord-bot"]
     }
   },
-  "sessionMemory": {
+  "selfImprovement": {
+    "enabled": true,
+    "beforeResetNote": true,
+    "skipSubagentBootstrap": true,
+    "ensureLearningFiles": true
+  },
+  "memoryReflection": {
+    "storeToLanceDB": true,
+    "injectMode": "inheritance+derived",
+    "agentId": "memory-distiller",
+    "messageCount": 120,
+    "maxInputChars": 24000,
+    "timeoutMs": 20000,
+    "thinkLevel": "medium",
+    "errorReminderMaxEntries": 3,
+    "dedupeErrorSignals": true,
+    "recall": {
+      "mode": "fixed",
+      "topK": 6,
+      "includeKinds": ["invariant"],
+      "maxAgeDays": 45,
+      "maxEntriesPerKey": 10,
+      "minRepeated": 2,
+      "minScore": 0.18,
+      "minPromptLength": 8
+    }
+  },
+  "mdMirror": {
     "enabled": false,
-    "messageCount": 15
+    "dir": "memory-md"
   }
 }
 ```
 
+Note: this example keeps `sessionStrategy: "systemSessionMemory"` for compatibility with existing users. The `memoryReflection.*` block documents the opt-in reflection pipeline, but it only becomes active after you explicitly switch `sessionStrategy` to `"memoryReflection"`.
+
 </details>
+
+### Parameter Mapping Notes (avoid common misconfig)
+
+`memory-lancedb-pro` does **not** support `recallTopK` / `recallThreshold`.
+
+Use these equivalents instead:
+
+- `recallTopK` → `retrieval.candidatePoolSize`
+- `recallThreshold` → combine `retrieval.minScore` + `retrieval.hardMinScore`
+
+A practical starting point for Chinese chat workloads:
+
+```json
+{
+  "autoCapture": true,
+  "autoRecall": true,
+  "autoRecallMinLength": 8,
+  "autoRecallSelectionMode": "mmr",
+  "autoRecallExcludeReflection": true,
+  "retrieval": {
+    "candidatePoolSize": 20,
+    "minScore": 0.45,
+    "hardMinScore": 0.55
+  }
+}
+```
 
 ### Access Reinforcement (1.0.26)
 
 To make frequently used memories decay more slowly, the retriever can extend the effective time-decay half-life based on **manual recall frequency** (spaced-repetition style).
 
 Config keys (under `retrieval`):
-- `reinforcementFactor` (range: 0–2, default: `0.5`) — set `0` to disable
-- `maxHalfLifeMultiplier` (range: 1–10, default: `3`) — hard cap: effective half-life ≤ base × multiplier
+- `reinforcementFactor` (range: 0-2, default: `0.5`) - set `0` to disable
+- `maxHalfLifeMultiplier` (range: 1-10, default: `3`) - hard cap: effective half-life ≤ base × multiplier
 
 Notes:
 - Reinforcement is **whitelisted to `source: "manual"`** (i.e. user/tool initiated recall), to avoid accidental strengthening from auto-recall.
@@ -409,10 +655,12 @@ Cross-encoder reranking supports multiple providers via `rerankProvider`:
 | **SiliconFlow** (free tier available) | `siliconflow` | `https://api.siliconflow.com/v1/rerank` | `BAAI/bge-reranker-v2-m3`, `Qwen/Qwen3-Reranker-8B` |
 | **Voyage AI** | `voyage` | `https://api.voyageai.com/v1/rerank` | `rerank-2.5` |
 | **Pinecone** | `pinecone` | `https://api.pinecone.io/rerank` | `bge-reranker-v2-m3` |
+| **vLLM / Docker Model Runner** | `vllm` | _requires custom endpoint_ | `Qwen3-Reranker` |
 
 Notes:
 - `voyage` sends `{ model, query, documents }` without `top_n`.
 - Voyage responses are parsed from `data[].relevance_score`.
+- `vllm` requires a custom `rerankEndpoint` (no API key needed). Only works on x86_64 NVIDIA platforms.
 
 <details>
 <summary><strong>SiliconFlow Example</strong></summary>
@@ -465,6 +713,25 @@ Notes:
 
 </details>
 
+<details>
+<summary><strong>vLLM / Docker Model Runner Example</strong></summary>
+
+```json
+{
+  "retrieval": {
+    "rerank": "cross-encoder",
+    "rerankProvider": "vllm",
+    "rerankEndpoint": "http://host.docker.internal:12434/engines/vllm/rerank",
+    "rerankModel": "ai/qwen3-reranker:0.6B"
+  }
+}
+```
+
+**Note:** vLLM reranking only works on x86_64 NVIDIA platforms. For macOS Apple Silicon, use `llama.cpp` for embeddings but not vLLM for reranking.
+```
+
+</details>
+
 ---
 
 ## Optional: JSONL Session Distillation (Auto-memories from chat logs)
@@ -480,7 +747,7 @@ Instead, **recommended (2026-02+)** is a **non-blocking `/new` pipeline**:
 - Trigger: `command:new` (you type `/new`)
 - Hook: enqueue a tiny JSON task file (fast; no LLM calls inside the hook)
 - Worker: a user-level systemd service watches the inbox and runs **Gemini Map-Reduce** on the session JSONL transcript
-- Store: writes **0–20** high-signal, atomic lessons into LanceDB Pro via `openclaw memory-pro import`
+- Store: writes **0-20** high-signal, atomic lessons into LanceDB Pro via `openclaw memory-pro import`
 - Keywords: each memory includes `Keywords (zh)` with a simple taxonomy (Entity + Action + Symptom). Entity keywords must be copied verbatim from the transcript (no hallucinated project names).
 - Notify: optional Telegram/Discord notification (even if 0 lessons)
 
@@ -519,7 +786,7 @@ and keeps a cursor here:
 
 The script is **safe**: it never modifies session logs.
 
-By default it skips historical reset snapshots (`*.reset.*`) and excludes the distiller agent itself (`memory-distiller`) to prevent self-ingestion loops.
+By default it skips historical reset snapshots (`*.reset.*`), slash-command/control-note lines (for example `/note self-improvement ...`), and excludes the distiller agent itself (`memory-distiller`) to prevent self-ingestion loops.
 
 ### Optional: restrict distillation sources (allowlist)
 
@@ -660,27 +927,60 @@ openclaw memory-pro migrate verify [--source /path]
 
 ## Custom Commands (e.g. `/lesson`)
 
-This plugin provides the core memory tools (`memory_store`, `memory_recall`, `memory_forget`, `memory_update`). You can define custom slash commands in your Agent's system prompt to create convenient shortcuts.
+This plugin provides tool-level building blocks. Slash commands such as `/lesson` are **not** built into the plugin itself; they are convenience commands you define in your Agent/system prompt, and they call the registered tools below.
 
-### Example: `/lesson` command
+### Recommended command shortcuts
 
-Add this to your `CLAUDE.md`, `AGENTS.md`, or system prompt:
+- `/remember <content>`
+  - call `memory_store`
+  - choose the most appropriate category / importance / scope
+- `/lesson <content>`
+  - call `memory_store` twice:
+    - once as `category=fact` for the lesson itself
+    - once as `category=decision` for the actionable rule
+- `/learn <summary>`
+  - call `self_improvement_log` with `type=learning`
+  - include `category`, `area`, `priority`, `details`, `suggestedAction` when available
+- `/error <summary>`
+  - call `self_improvement_log` with `type=error`
+  - include reproducible symptom, context, and prevention / fix
+- `/learnings` or `/review-learnings`
+  - call `self_improvement_review`
+- `/skill <learningId> <skill-name>`
+  - call `self_improvement_extract_skill`
+
+### Example prompt snippets
+
+Add rules like these to your `CLAUDE.md`, `AGENTS.md`, or system prompt:
 
 ```markdown
 ## /lesson command
 When the user sends `/lesson <content>`:
-1. Use memory_store to save as category=fact (the raw knowledge)
-2. Use memory_store to save as category=decision (actionable takeaway)
-3. Confirm what was saved
-```
+1. Use `memory_store` to save the raw lesson as `category=fact`
+2. Use `memory_store` again to save the actionable takeaway as `category=decision`
+3. Confirm both saved items briefly
 
-### Example: `/remember` command
+## /learn command
+When the user sends `/learn <summary>`:
+1. Use `self_improvement_log` with `type=learning`
+2. Include `details`, `suggestedAction`, `category`, `area`, and `priority` if the user provided them
+3. Confirm the created learning entry id
 
-```markdown
-## /remember command
-When the user sends `/remember <content>`:
-1. Use memory_store to save with appropriate category and importance
-2. Confirm with the stored memory ID
+## /error command
+When the user sends `/error <summary>`:
+1. Use `self_improvement_log` with `type=error`
+2. Capture the reproducible failure signature, context, and suggested prevention/fix
+3. Confirm the created error entry id
+
+## /review-learnings command
+When the user sends `/review-learnings`:
+1. Use `self_improvement_review`
+2. Return the governance snapshot
+
+## /skill command
+When the user sends `/skill <learningId> <skill-name>`:
+1. Use `self_improvement_extract_skill`
+2. Confirm the generated skill path
 ```
 
 ### Built-in Tools Reference
@@ -691,8 +991,13 @@ When the user sends `/remember <content>`:
 | `memory_recall` | Search memories (hybrid vector + BM25 retrieval) |
 | `memory_forget` | Delete a memory by ID or search query |
 | `memory_update` | Update an existing memory in-place |
+| `memory_list` | List recent memories with optional filtering |
+| `memory_stats` | Show scope/category statistics |
+| `self_improvement_log` | Log a structured learning/error entry into `.learnings/` |
+| `self_improvement_review` | Summarize governance backlog from `.learnings/` |
+| `self_improvement_extract_skill` | Create a skill scaffold from a learning entry |
 
-> **Note**: These tools are registered automatically when the plugin loads. Custom commands like `/lesson` are not built into the plugin — they are defined at the Agent/system-prompt level and simply call these tools.
+> **Note**: custom commands like `/lesson`, `/learn`, `/error`, `/review-learnings`, or `/skill` are prompt-level shortcuts. The actual plugin surface is the tool set above.
 
 ---
 
@@ -705,9 +1010,9 @@ LanceDB table `memories`:
 | `id` | string (UUID) | Primary key |
 | `text` | string | Memory text (FTS indexed) |
 | `vector` | float[] | Embedding vector |
-| `category` | string | `preference` / `fact` / `decision` / `entity` / `other` |
+| `category` | string | `preference` / `fact` / `decision` / `entity` / `reflection` / `other` |
 | `scope` | string | Scope identifier (e.g., `global`, `agent:main`) |
-| `importance` | float | Importance score 0–1 |
+| `importance` | float | Importance score 0-1 |
 | `timestamp` | int64 | Creation timestamp (ms) |
 | `metadata` | string (JSON) | Extended metadata |
 
@@ -728,7 +1033,7 @@ upgrade to **memory-lancedb-pro >= 1.0.14**. This plugin now coerces these value
 > **For OpenClaw users**: copy the code block below into your `AGENTS.md` so your agent enforces these rules automatically.
 
 ```markdown
-## Rule 1 — 双层记忆存储（铁律）
+## Rule 1 - 双层记忆存储（铁律）
 
 Every pitfall/lesson learned → IMMEDIATELY store TWO memories to LanceDB before moving on:
 
@@ -742,24 +1047,24 @@ Every pitfall/lesson learned → IMMEDIATELY store TWO memories to LanceDB befor
   Do NOT proceed to next topic until both are stored and verified.
 - Also update relevant SKILL.md files to prevent recurrence.
 
-## Rule 2 — LanceDB 卫生
+## Rule 2 - LanceDB 卫生
 
 Entries must be short and atomic (< 500 chars). Never store raw conversation summaries, large blobs, or duplicates.
 Prefer structured format with keywords for retrieval.
 
-## Rule 3 — Recall before retry
+## Rule 3 - Recall before retry
 
 On ANY tool failure, repeated error, or unexpected behavior, ALWAYS `memory_recall` with relevant keywords
 (error message, tool name, symptom) BEFORE retrying. LanceDB likely already has the fix.
 Blind retries waste time and repeat known mistakes.
 
-## Rule 4 — 编辑前确认目标代码库
+## Rule 4 - 编辑前确认目标代码库
 
 When working on memory plugins, confirm you are editing the intended package
 (e.g., `memory-lancedb-pro` vs built-in `memory-lancedb`) before making changes;
 use `memory_recall` + filesystem search to avoid patching the wrong repo.
 
-## Rule 5 — 插件代码变更必须清 jiti 缓存（MANDATORY）
+## Rule 5 - 插件代码变更必须清 jiti 缓存（MANDATORY）
 
 After modifying ANY `.ts` file under `plugins/`, MUST run `rm -rf /tmp/jiti/` BEFORE `openclaw gateway restart`.
 jiti caches compiled TS; restart alone loads STALE code. This has caused silent bugs multiple times.
